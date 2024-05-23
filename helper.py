@@ -1,125 +1,78 @@
-
 import os
-import webvtt
 import librosa
 import soundfile as sf
-from datasets import Dataset,  Audio, DatasetDict
-from datetime import datetime
-import torch
+import pandas as pd
+from datasets import Dataset, Audio
 
-
-
-repo_name = "chichewa-dataset"
-data_folder = "./chich_speech_audio_files"
-save_path = f"data/{repo_name}-dataset"
-hf_username = "Rhode01"
-def parse_time(time_str):
-    hours, minutes, seconds_milliseconds = time_str.split(':')
-    seconds, milliseconds = seconds_milliseconds.split('.')
-    
-    hours = int(hours)
-    minutes = int(minutes)
-    seconds = int(seconds)
-    milliseconds = int(milliseconds)
-    
- 
-    parsed_time = datetime(year=1900, month=1, day=1, hour=hours, minute=minutes, second=seconds, microsecond=milliseconds * 1000)
-    
-    return parsed_time
-
-def time_to_samples(time_ms, sr):
-    return int((time_ms / 1000.0) * sr)
-
-def transform_data(data):
-    transformed = {"audio": [], "text": [], "start_time": [], "end_time": []}
-    for item in data:
-        for key in transformed:
-            transformed[key].append(item[key])
-    return transformed
 def process_audio_folder(data_folder, output_dir, max_duration=30):
     os.makedirs(output_dir, exist_ok=True)
-    data = []
+    dataset = []
+
     for filename in os.listdir(data_folder):
         if filename.endswith(".wav"):
             audio_path = os.path.join(data_folder, filename)
             base_filename = os.path.splitext(filename)[0]  
             transcription_path = os.path.join(data_folder, base_filename + ".txt")
+
             if os.path.exists(transcription_path):
-                try:
-                    data.extend(process_audio_file(audio_path, transcription_path, output_dir, max_duration))
-                except OSError as e:
-                    print(f"Error processing {audio_path} or {transcription_path}: {e}")
-    return data
+                segments = process_audio_file(audio_path, transcription_path, output_dir, max_duration)
+                dataset.extend(segments)
+
+    return dataset
 
 def process_audio_file(audio_path, transcription_path, output_dir, max_duration=30):
-    full_audio, sr = librosa.load(audio_path, sr=None, mono=True)
-
+    sr = 16000  # Sampling rate in Hz
+    full_audio, _ = librosa.load(audio_path, sr=sr, mono=True)
     with open(transcription_path, 'r') as file:
         transcription_text = file.read()
 
-    data = []
-    current_text = []
-    current_start = None
-    accumulated_duration = 0
-    segment_counter = 0
+    duration = librosa.get_duration(y=full_audio, sr=sr)
+    num_segments = int(duration / max_duration) + 1
 
-    for caption in webvtt.from_srt(transcription_text):
-        start_time = parse_time(caption.start)
-        end_time = parse_time(caption.end)
-        duration = (end_time - start_time).total_seconds()
+    segments = []
+    for i in range(num_segments):
+        start_time = i * max_duration
+        end_time = min((i + 1) * max_duration, duration)
+        segment_audio = full_audio[int(start_time * sr):int(end_time * sr)]
 
-        if current_start is None:
-            current_start = start_time
+        segment_text = transcription_text[:segment_audio.shape[0]]  
+        transcription_text = transcription_text[segment_audio.shape[0]:]
 
-        if accumulated_duration + duration <= max_duration:
-            current_text.append(caption.text)
-            accumulated_duration += duration
-        else:
-            segment_counter += 1
-            segment_filename = f"{output_dir}/segment_{segment_counter}.wav"
-            start_sample = time_to_samples(current_start, sr)
-            end_sample = time_to_samples(current_start + max_duration, sr)
-            audio_segment = full_audio[start_sample:end_sample]
-            sf.write(segment_filename, audio_segment, sr, format='wav')
-
-            data.append({
-                "audio": segment_filename,
-                "text": " ".join(current_text),
-                "start_time": current_start.strftime("%H:%M:%S.%f"),
-                "end_time": (current_start + max_duration).strftime("%H:%M:%S.%f")
-            })
-
-            current_text = [caption.text]
-            current_start = start_time
-            accumulated_duration = duration
-
-    if current_text:
-        segment_counter += 1
-        segment_filename = f"{output_dir}/segment_{segment_counter}.wav"
-        start_sample = time_to_samples(current_start, sr)
-        end_sample = len(full_audio)
-        audio_segment = full_audio[start_sample:end_sample]
-        sf.write(segment_filename, audio_segment, sr, format='wav')
-
-        data.append({
-            "audio": segment_filename,
-            "text": " ".join(current_text),
-            "start_time": current_start.strftime("%H:%M:%S.%f"),
-            "end_time": end_time.strftime("%H:%M:%S.%f")
+        segments.append({
+            "audio": segment_audio,
+            "text": segment_text,
+            "start_time": start_time,
+            "end_time": end_time
         })
 
-    return data
+    return segments
 
-def create_dataset(data_folder):
-    train_data = process_audio_folder(data_folder, save_path)
-    train_dataset = Dataset.from_dict(transform_data(train_data))
-    dataset_dict = DatasetDict({
-        "train": train_dataset,
-    })
-    return dataset_dict
+def create_dataset(data_folder, save_path):
+    dataset = process_audio_folder(data_folder, save_path)
+    audio_save_dir = os.path.join(save_path, "audio")
+    os.makedirs(audio_save_dir, exist_ok=True)
 
-dataset = create_dataset(data_folder)
+    dataset_data = []
+    for idx, item in enumerate(dataset):
+        audio_filename = f"segment_{idx + 1}.wav"
+        audio_dst_path = os.path.join(audio_save_dir, audio_filename)
+        sf.write(audio_dst_path, item["audio"], 16000, subtype='PCM_16')  
+        item["audio"] = audio_dst_path  
+        dataset_data.append(item)
 
-dataset.save_to_disk(save_path)
-dataset.cast_column("audio", Audio())
-dataset.push_to_hub(repo_id=f"{hf_username}/{repo_name}")
+    train_data_dict = {
+        "audio": [item["audio"] for item in dataset_data],
+        "text": [item["text"] for item in dataset_data],
+        "start_time": [item["start_time"] for item in dataset_data],
+        "end_time": [item["end_time"] for item in dataset_data],
+    }
+    dataset = Dataset.from_dict(train_data_dict)
+    dataset.save_to_disk(save_path)
+    return dataset
+
+
+data_folder = "./chich_speech_audio_files"
+save_path = "./data/chichewa-dataset"
+
+dataset = create_dataset(data_folder, save_path)
+dataset.push_to_hub(repo_id="Rhode01/chichewa-dataset")
